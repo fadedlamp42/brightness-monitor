@@ -1,8 +1,9 @@
 """voice output for brightness-monitor via cute-say.
 
-two modes:
+three modes:
   - whisper: short, ambient hourly readout via chatterbox with [whispering] tag
   - full report: thorough status via kokoro at 1.4x speed covering all windows
+  - auth alerts: notify about expired tokens and prompt for re-login
 """
 
 from __future__ import annotations
@@ -131,7 +132,11 @@ def speak_full_status(usage: UsageData) -> None:
     """
     text = format_voice_status(usage)
     log.info("voice readout: %(text)s", {"text": text})
+    _speak_kokoro(text)
 
+
+def _speak_kokoro(text: str) -> None:
+    """shared helper: fire-and-forget kokoro speech at 1.4x speed."""
     try:
         subprocess.Popen(
             ["cute-say", "-k", "-s", "1.4", text],
@@ -139,4 +144,31 @@ def speak_full_status(usage: UsageData) -> None:
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        log.warning("cute-say not found in PATH, skipping voice readout")
+        log.warning("cute-say not found in PATH, skipping speech")
+
+
+def announce_auth_expired() -> None:
+    """tell the user their auth token expired and how to fix it."""
+    text = "hey, gotta login"
+    log.info("auth expired announcement")
+    _speak_kokoro(text)
+
+
+def announce_auth_login_started() -> None:
+    """confirm that the login flow has been kicked off."""
+    text = "opening login now"
+    log.info("auth login started announcement")
+    _speak_kokoro(text)
+
+
+def announce_auth_login_result(success: bool) -> None:
+    """report whether re-authentication succeeded or failed."""
+    if success:
+        text = "logged back in, resuming"
+    else:
+        text = "that didn't work, try again"
+    log.info(
+        "auth login result: %(result)s",
+        {"result": "success" if success else "failure"},
+    )
+    _speak_kokoro(text)

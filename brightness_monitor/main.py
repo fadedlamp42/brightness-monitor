@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import signal
+import subprocess
 import threading
 import time
 from typing import Optional
@@ -29,9 +31,15 @@ from brightness_monitor.keyboard import (
     pulse_brightness,
     blink_percentage_readout,
 )
-from brightness_monitor.speech import whisper_hourly, speak_full_status
+from brightness_monitor.speech import (
+    whisper_hourly,
+    speak_full_status,
+    announce_auth_expired,
+    announce_auth_login_started,
+    announce_auth_login_result,
+)
 from brightness_monitor.storage import initialize_database, record_poll
-from brightness_monitor.usage import get_token, fetch_usage, UsageData
+from brightness_monitor.usage import get_token, fetch_usage, AuthExpiredError, UsageData
 
 log = logging.getLogger("brightness_monitor")
 
@@ -103,6 +111,45 @@ def _readout_bucket(remaining: float, every_percent: float) -> int:
     return int(remaining / every_percent)
 
 
+def _attempt_reauth() -> bool:
+    """run `claude auth login` and return whether it succeeded.
+
+    blocks until the OAuth flow completes (user clicks through browser).
+    returns False if claude CLI isn't found or the process exits non-zero.
+    """
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        log.error("claude CLI not found in PATH, cannot re-authenticate")
+        return False
+
+    log.info("starting claude auth login")
+    try:
+        result = subprocess.run(
+            [claude_path, "auth", "login"],
+            timeout=120,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            log.info("claude auth login succeeded")
+            return True
+
+        log.warning(
+            "claude auth login failed (exit %(code)d): %(stderr)s",
+            {"code": result.returncode, "stderr": result.stderr.strip()},
+        )
+        return False
+    except subprocess.TimeoutExpired:
+        log.warning("claude auth login timed out after 120s")
+        return False
+    except Exception as error:
+        log.warning(
+            "claude auth login error: %(error)s",
+            {"error": error},
+        )
+        return False
+
+
 def run_daemon(
     config: Config,
     dry_run: bool,
@@ -117,6 +164,7 @@ def run_daemon(
 
     # SIGUSR1 triggers an immediate readout (cmd+shift+b)
     # speech: whispered hourly, keyboard: blink readout
+    # when auth is expired: triggers re-authentication via claude auth login
     readout_requested = False
 
     def handle_usr1(signum, frame):
@@ -153,13 +201,41 @@ def run_daemon(
         log.info("took control of keyboard brightness")
 
     last_bucket: Optional[int] = None
+    auth_expired = False
 
     try:
         while handler.running:
+            # when auth is expired, wait for SIGUSR1 to trigger re-login
+            if auth_expired:
+                if readout_requested:
+                    readout_requested = False
+                    if config.output.speech:
+                        announce_auth_login_started()
+                    success = _attempt_reauth()
+                    if config.output.speech:
+                        announce_auth_login_result(success)
+                    if success:
+                        auth_expired = False
+                        log.info("auth restored, resuming normal operation")
+                        # fall through to poll immediately
+                    else:
+                        handler.interruptible_sleep(config.poll_interval)
+                        continue
+                else:
+                    handler.interruptible_sleep(config.poll_interval)
+                    continue
+
             # re-read token each poll so we pick up Keychain refreshes
             try:
                 token = get_token(explicit_token=token_override)
                 usage = fetch_usage(token)
+            except AuthExpiredError:
+                log.warning("auth token expired")
+                if not auth_expired and config.output.speech:
+                    announce_auth_expired()
+                auth_expired = True
+                handler.interruptible_sleep(config.poll_interval)
+                continue
             except RuntimeError as error:
                 log.warning(
                     "usage fetch failed, skipping: %(error)s",

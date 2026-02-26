@@ -28,6 +28,10 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 TOKEN_ENV_VAR = "CLAUDE_OAUTH_TOKEN"
 
 
+class AuthExpiredError(RuntimeError):
+    """raised when the OAuth token is expired or invalid (HTTP 401)."""
+
+
 @dataclass
 class UsageWindow:
     name: str
@@ -119,7 +123,7 @@ def fetch_usage(token: str) -> UsageData:
             data = json.loads(response.read().decode())
     except urllib.error.HTTPError as error:
         if error.code == 401:
-            raise RuntimeError(
+            raise AuthExpiredError(
                 "OAuth token expired or invalid; "
                 "re-authenticate or provide a fresh token"
             ) from error
