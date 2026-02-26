@@ -32,13 +32,17 @@ from brightness_monitor.keyboard import (
     blink_percentage_readout,
 )
 from brightness_monitor.speech import (
-    whisper_hourly,
+    speak_hourly_status,
     speak_full_status,
     announce_auth_expired,
     announce_auth_login_started,
     announce_auth_login_result,
 )
-from brightness_monitor.storage import initialize_database, record_poll
+from brightness_monitor.storage import (
+    initialize_database,
+    record_poll,
+    calculate_burn_rate,
+)
 from brightness_monitor.usage import get_token, fetch_usage, AuthExpiredError, UsageData
 
 log = logging.getLogger("brightness_monitor")
@@ -290,9 +294,14 @@ def run_daemon(
             if should_readout:
                 clamped = max(0, min(99, int(remaining)))
 
-                # whispered hourly readout via chatterbox
+                # hourly status with pace observation via naturalized chatterbox
                 if config.output.speech:
-                    whisper_hourly(usage)
+                    burn_rate = calculate_burn_rate(
+                        db,
+                        tracked.name,
+                        tracked.resets_at,
+                    )
+                    speak_hourly_status(usage, burn_rate)
 
                 # blink readout via keyboard backlight
                 if keyboard.enabled:

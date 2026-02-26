@@ -1,7 +1,7 @@
 """voice output for brightness-monitor via cute-say.
 
 three modes:
-  - whisper: short, ambient hourly readout via chatterbox with [whispering] tag
+  - hourly status: remaining %, reset time, and pace observation via naturalized chatterbox
   - full report: thorough status via kokoro at 1.4x speed covering all windows
   - auth alerts: notify about expired tokens and prompt for re-login
 """
@@ -13,6 +13,7 @@ import subprocess
 from datetime import datetime
 from typing import Optional
 
+from brightness_monitor.storage import BurnRate
 from brightness_monitor.usage import UsageData
 
 log = logging.getLogger(__name__)
@@ -98,30 +99,33 @@ def format_voice_status(usage: UsageData) -> str:
     return ". ".join(parts)
 
 
-def whisper_hourly(usage: UsageData) -> None:
-    """fire-and-forget: whisper the hourly remaining % via chatterbox.
+def speak_hourly_status(usage: UsageData, burn_rate: BurnRate) -> None:
+    """fire-and-forget: hourly status with remaining and projected utilization.
 
-    uses the [whispering] paralinguistic tag for a subtle, ambient readout.
-    chatterbox (default mode) supports these tags natively.
+    format: remaining % first, reset time, then projected window utilization.
+    uses kokoro at 1.4x.
     """
     windows_by_name = {w.name: w for w in usage.windows}
     five_hour = windows_by_name.get("five_hour")
     if not five_hour:
-        log.warning("no five_hour window available for whisper readout")
+        log.warning("no five_hour window available for hourly readout")
         return
 
     hr_left = int(100 - five_hour.utilization)
-    text = "[whispering] %d percent" % hr_left
-    log.info("whisper readout: %(text)s", {"text": text})
+    reset = _format_relative_time(five_hour.resets_at)
 
-    try:
-        subprocess.Popen(
-            ["cute-say", text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        log.warning("cute-say not found in PATH, skipping whisper readout")
+    parts = ["%d percent remaining" % hr_left]
+    if reset:
+        parts.append("resets %s" % reset)
+
+    projected = burn_rate.projected_remaining_at_reset
+    if projected is not None:
+        projected_used = max(0, min(100, 100 - int(projected)))
+        parts.append("on pace to use %d percent of the window" % projected_used)
+
+    text = ". ".join(parts)
+    log.info("hourly readout: %(text)s", {"text": text})
+    _speak_kokoro(text)
 
 
 def speak_full_status(usage: UsageData) -> None:

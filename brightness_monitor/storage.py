@@ -3,12 +3,16 @@
 stores every poll result as one row per usage window. the database
 lives in the repo root so it can be version-controlled as a lightweight
 backup of usage history.
+
+also provides burn rate analysis by looking at recent poll history
+to calculate consumption rate and project forward to window reset.
 """
 
 from __future__ import annotations
 
 import logging
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -77,4 +81,99 @@ def record_poll(connection: sqlite3.Connection, usage: UsageData) -> None:
     log.debug(
         "recorded %(count)d usage windows at %(time)s",
         {"count": len(rows), "time": now},
+    )
+
+
+@dataclass
+class BurnRate:
+    """usage consumption rate and projection for a single window."""
+
+    utilization_per_hour: Optional[float]
+    """% consumed per hour based on recent history. None if insufficient data."""
+
+    projected_remaining_at_reset: Optional[float]
+    """projected % remaining when window resets. None if no reset time or no rate."""
+
+    hours_until_reset: Optional[float]
+    """hours until window resets. None if no reset time."""
+
+    sample_minutes: float
+    """how many minutes of history the rate was calculated from."""
+
+
+# how far back to look for burn rate calculation
+BURN_RATE_LOOKBACK_MINUTES = 30
+
+# minimum data points needed to calculate a meaningful rate
+BURN_RATE_MINIMUM_POLLS = 3
+
+
+def calculate_burn_rate(
+    connection: sqlite3.Connection,
+    window_name: str,
+    resets_at: Optional[datetime],
+) -> BurnRate:
+    """calculate consumption rate from recent poll history.
+
+    looks at the last 30 minutes of polls for the given window,
+    computes linear utilization rate, and projects forward to the
+    reset time to estimate how many tokens will be left (or wasted).
+    """
+    cutoff = datetime.now(tz=timezone.utc).isoformat()
+    lookback_seconds = BURN_RATE_LOOKBACK_MINUTES * 60
+
+    rows = connection.execute(
+        "SELECT polled_at, utilization FROM usage_polls "
+        "WHERE window_name = ? "
+        "AND polled_at > datetime(?, '-%d seconds') "
+        "ORDER BY polled_at ASC" % lookback_seconds,
+        (window_name, cutoff),
+    ).fetchall()
+
+    # compute hours until reset
+    hours_until_reset = None
+    if resets_at is not None:
+        now = datetime.now(tz=resets_at.tzinfo)
+        seconds_left = (resets_at - now).total_seconds()
+        hours_until_reset = max(0.0, seconds_left / 3600)
+
+    if len(rows) < BURN_RATE_MINIMUM_POLLS:
+        return BurnRate(
+            utilization_per_hour=None,
+            projected_remaining_at_reset=None,
+            hours_until_reset=hours_until_reset,
+            sample_minutes=0.0,
+        )
+
+    # use first and last data points for rate
+    first_time = datetime.fromisoformat(rows[0][0])
+    last_time = datetime.fromisoformat(rows[-1][0])
+    first_util = rows[0][1]
+    last_util = rows[-1][1]
+
+    elapsed_hours = (last_time - first_time).total_seconds() / 3600
+    sample_minutes = (last_time - first_time).total_seconds() / 60
+
+    if elapsed_hours < 0.001:
+        # timestamps too close together, can't compute rate
+        return BurnRate(
+            utilization_per_hour=None,
+            projected_remaining_at_reset=None,
+            hours_until_reset=hours_until_reset,
+            sample_minutes=sample_minutes,
+        )
+
+    utilization_per_hour = (last_util - first_util) / elapsed_hours
+
+    # project forward to reset time
+    projected_remaining_at_reset = None
+    if hours_until_reset is not None:
+        projected_utilization = last_util + (utilization_per_hour * hours_until_reset)
+        projected_remaining_at_reset = 100.0 - projected_utilization
+
+    return BurnRate(
+        utilization_per_hour=utilization_per_hour,
+        projected_remaining_at_reset=projected_remaining_at_reset,
+        hours_until_reset=hours_until_reset,
+        sample_minutes=sample_minutes,
     )
