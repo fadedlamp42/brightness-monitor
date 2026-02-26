@@ -32,6 +32,12 @@ class ReadoutConfig:
 
 
 @dataclass
+class OutputConfig:
+    speech: bool = True
+    keyboard: bool = True
+
+
+@dataclass
 class Config:
     window: str = "five_hour"
     poll_interval: int = 60
@@ -40,6 +46,7 @@ class Config:
     pulse_threshold: float = 10.0
     pulse_period: float = 3.0
     readout: ReadoutConfig = field(default_factory=ReadoutConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
 
 
 def load_config(path: Optional[Path] = None) -> Config:
@@ -64,13 +71,23 @@ def load_config(path: Optional[Path] = None) -> Config:
         }
     )
 
+    output_raw = raw.pop("output", {}) or {}
+    output = OutputConfig(
+        **{
+            key: output_raw[key]
+            for key in OutputConfig.__dataclass_fields__
+            if key in output_raw
+        }
+    )
+
     config = Config(
         **{
             key: raw[key]
             for key in Config.__dataclass_fields__
-            if key in raw and key != "readout"
+            if key in raw and key not in ("readout", "output")
         }
     )
     config.readout = readout
+    config.output = output
 
     return config

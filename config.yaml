@@ -11,6 +11,14 @@ window: "five_hour"
 # how often to poll the Claude usage API
 poll_interval: 60
 
+# -- output surfaces --
+# toggle which output channels are active.
+# speech: whispered hourly readouts (cmd+shift+b) and full voice reports (cmd+shift+alt+b)
+# keyboard: ambient brightness mapping, pulse mode, and blink readouts
+output:
+  speech: true
+  keyboard: false
+
 # brightness floor — the dimmest the keyboard goes at 100% utilization
 # 0.0 = fully dark, 0.05 = faint glow
 min_brightness: 0.0

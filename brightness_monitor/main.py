@@ -25,6 +25,7 @@ from brightness_monitor.brightness import (
     suspend_idle_dimming,
 )
 from brightness_monitor.config import Config, load_config
+from brightness_monitor.storage import initialize_database, record_poll
 from brightness_monitor.usage import get_token, fetch_usage, UsageData
 
 log = logging.getLogger("brightness_monitor")
@@ -276,11 +277,37 @@ def format_voice_status(usage: UsageData) -> str:
     return ". ".join(parts)
 
 
-def speak_status(usage: UsageData) -> None:
-    """fire-and-forget: format a voice status and send it to cute-say.
+def whisper_hourly(usage: UsageData) -> None:
+    """fire-and-forget: whisper the hourly remaining % via chatterbox.
 
-    runs cute-say as a detached subprocess so the daemon loop isn't blocked
-    by TTS latency.
+    uses the [whispering] paralinguistic tag for a subtle, ambient readout.
+    chatterbox (default mode) supports these tags natively.
+    """
+    windows_by_name = {w.name: w for w in usage.windows}
+    five_hour = windows_by_name.get("five_hour")
+    if not five_hour:
+        log.warning("no five_hour window available for whisper readout")
+        return
+
+    hr_left = int(100 - five_hour.utilization)
+    text = "[whispering] %d percent" % hr_left
+    log.info("whisper readout: %(text)s", {"text": text})
+
+    try:
+        subprocess.Popen(
+            ["cute-say", text],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        log.warning("cute-say not found in PATH, skipping whisper readout")
+
+
+def speak_full_status(usage: UsageData) -> None:
+    """fire-and-forget: thorough voice status via kokoro at 1.4x speed.
+
+    covers hourly, weekly, per-model breakdown, and reset times.
+    uses kokoro mode for speed control.
     """
     text = format_voice_status(usage)
     log.info("voice readout: %(text)s", {"text": text})
@@ -314,7 +341,8 @@ def run_daemon(
     signal.signal(signal.SIGINT, handler.handle_signal)
     signal.signal(signal.SIGTERM, handler.handle_signal)
 
-    # SIGUSR1 triggers an immediate blink readout (cmd+shift+b)
+    # SIGUSR1 triggers an immediate readout (cmd+shift+b)
+    # speech: whispered hourly, keyboard: blink readout
     readout_requested = False
 
     def handle_usr1(signum, frame):
@@ -325,7 +353,7 @@ def run_daemon(
 
     signal.signal(signal.SIGUSR1, handle_usr1)
 
-    # SIGUSR2 triggers a spoken voice readout via cute-say (cmd+shift+alt+b)
+    # SIGUSR2 triggers a full spoken report via cute-say (cmd+shift+alt+b)
     voice_readout_requested = False
 
     def handle_usr2(signum, frame):
@@ -341,7 +369,10 @@ def run_daemon(
     get_token(explicit_token=token_override)
     log.info("authenticated")
 
-    if not dry_run:
+    # initialize usage history database
+    db = initialize_database()
+
+    if not dry_run and config.output.keyboard:
         handler.save_state()
         suspend_idle_dimming(True)
         set_auto_brightness(False)
@@ -362,6 +393,15 @@ def run_daemon(
                 )
                 handler.interruptible_sleep(config.poll_interval)
                 continue
+
+            # record every poll to sqlite for usage history
+            try:
+                record_poll(db, usage)
+            except Exception as error:
+                log.warning(
+                    "failed to record poll to database: %(error)s",
+                    {"error": error},
+                )
 
             if config.window == "most_constrained":
                 tracked = usage.most_constrained
@@ -399,68 +439,82 @@ def run_daemon(
 
             if should_readout:
                 clamped = max(0, min(99, int(remaining)))
-                if dry_run:
-                    log.info(
-                        "readout (dry): %(pct)d%% -> %(tens)d + %(ones)d blinks",
-                        {
-                            "pct": clamped,
-                            "tens": clamped // 10,
-                            "ones": clamped % 10,
-                        },
-                    )
-                else:
-                    blink_percentage_readout(remaining, config, handler)
 
-            # voice readout via cute-say (independent of blink readout)
+                # whispered hourly readout via chatterbox
+                if config.output.speech:
+                    whisper_hourly(usage)
+
+                # blink readout via keyboard backlight
+                if config.output.keyboard:
+                    if dry_run:
+                        log.info(
+                            "readout (dry): %(pct)d%% -> %(tens)d + %(ones)d blinks",
+                            {
+                                "pct": clamped,
+                                "tens": clamped // 10,
+                                "ones": clamped % 10,
+                            },
+                        )
+                    else:
+                        blink_percentage_readout(remaining, config, handler)
+
+            # full voice report via kokoro (independent of standard readout)
             if voice_readout_requested:
                 voice_readout_requested = False
-                speak_status(usage)
+                if config.output.speech:
+                    speak_full_status(usage)
 
             last_bucket = current_bucket
 
-            if remaining <= config.pulse_threshold:
-                # pulse between 0 and the remaining percentage
-                pulse_max = remaining / 100.0
-                log.info(
-                    "pulse mode on %(window)s: %(remaining).1f%% left, "
-                    "breathing 0-%(max).3f",
-                    {
-                        "window": tracked.name,
-                        "remaining": remaining,
-                        "max": pulse_max,
-                    },
-                )
-                if dry_run:
-                    handler.interruptible_sleep(config.poll_interval)
-                else:
-                    pulse_brightness(
-                        pulse_max,
-                        config.poll_interval,
-                        config.pulse_period,
-                        config.fade_speed,
-                        handler,
+            # keyboard brightness control — only when keyboard output is enabled
+            if config.output.keyboard:
+                if remaining <= config.pulse_threshold:
+                    pulse_max = remaining / 100.0
+                    log.info(
+                        "pulse mode on %(window)s: %(remaining).1f%% left, "
+                        "breathing 0-%(max).3f",
+                        {
+                            "window": tracked.name,
+                            "remaining": remaining,
+                            "max": pulse_max,
+                        },
                     )
+                    if dry_run:
+                        handler.interruptible_sleep(config.poll_interval)
+                    else:
+                        pulse_brightness(
+                            pulse_max,
+                            config.poll_interval,
+                            config.pulse_period,
+                            config.fade_speed,
+                            handler,
+                        )
+
+                else:
+                    brightness = utilization_to_brightness(
+                        tracked.utilization,
+                        config.min_brightness,
+                    )
+                    log.info(
+                        "steady: %(window)s %(util).1f%% used -> brightness %(b).3f",
+                        {
+                            "window": tracked.name,
+                            "util": tracked.utilization,
+                            "b": brightness,
+                        },
+                    )
+                    if not dry_run:
+                        set_brightness(brightness, fade_speed=config.fade_speed)
+                    handler.interruptible_sleep(config.poll_interval)
 
             else:
-                brightness = utilization_to_brightness(
-                    tracked.utilization,
-                    config.min_brightness,
-                )
-                log.info(
-                    "steady: %(window)s %(util).1f%% used -> brightness %(b).3f",
-                    {
-                        "window": tracked.name,
-                        "util": tracked.utilization,
-                        "b": brightness,
-                    },
-                )
-                if not dry_run:
-                    set_brightness(brightness, fade_speed=config.fade_speed)
+                # no keyboard output — just sleep until next poll
                 handler.interruptible_sleep(config.poll_interval)
 
     finally:
-        if not dry_run:
+        if not dry_run and config.output.keyboard:
             handler.restore_state()
+        db.close()
         log.info("shutdown complete")
 
 
@@ -507,7 +561,8 @@ def main():
 
     log.info(
         "config: window=%(window)s, poll=%(poll)ds, fade=%(fade)d, "
-        "pulse<%(pulse).0f%%, readout every %(every).0f%% below %(thresh).0f%%",
+        "pulse<%(pulse).0f%%, readout every %(every).0f%% below %(thresh).0f%%, "
+        "output: speech=%(speech)s keyboard=%(keyboard)s",
         {
             "window": config.window,
             "poll": config.poll_interval,
@@ -515,6 +570,8 @@ def main():
             "pulse": config.pulse_threshold,
             "every": config.readout.every_percent,
             "thresh": config.readout.threshold,
+            "speech": config.output.speech,
+            "keyboard": config.output.keyboard,
         },
     )
 
