@@ -32,21 +32,33 @@ class ReadoutConfig:
 
 
 @dataclass
+class KeyboardConfig:
+    enabled: bool = True
+    min_brightness: float = 0.0
+    fade_speed: int = 0
+    pulse_threshold: float = 10.0
+    pulse_period: float = 3.0
+    readout: ReadoutConfig = field(default_factory=ReadoutConfig)
+
+
+@dataclass
 class OutputConfig:
     speech: bool = True
-    keyboard: bool = True
+    keyboard: KeyboardConfig = field(default_factory=KeyboardConfig)
 
 
 @dataclass
 class Config:
     window: str = "five_hour"
     poll_interval: int = 60
-    min_brightness: float = 0.0
-    fade_speed: int = 0
-    pulse_threshold: float = 10.0
-    pulse_period: float = 3.0
-    readout: ReadoutConfig = field(default_factory=ReadoutConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+
+
+def _parse_nested_dataclass(dataclass_type, raw: dict):
+    """parse a dict into a dataclass, ignoring unknown keys."""
+    return dataclass_type(
+        **{key: raw[key] for key in dataclass_type.__dataclass_fields__ if key in raw}
+    )
 
 
 def load_config(path: Optional[Path] = None) -> Config:
@@ -62,32 +74,31 @@ def load_config(path: Optional[Path] = None) -> Config:
 
     log.debug("loaded config from %(path)s", {"path": config_path})
 
-    readout_raw = raw.pop("readout", {}) or {}
-    readout = ReadoutConfig(
-        **{
-            key: readout_raw[key]
-            for key in ReadoutConfig.__dataclass_fields__
-            if key in readout_raw
-        }
-    )
-
+    # parse output section
     output_raw = raw.pop("output", {}) or {}
+
+    # keyboard is nested: output.keyboard.{enabled, min_brightness, ...readout}
+    keyboard_raw = output_raw.pop("keyboard", {}) or {}
+    readout_raw = keyboard_raw.pop("readout", {}) or {}
+
+    readout = _parse_nested_dataclass(ReadoutConfig, readout_raw)
+
+    keyboard = _parse_nested_dataclass(KeyboardConfig, keyboard_raw)
+    keyboard.readout = readout
+
+    # speech is a simple bool at output.speech
     output = OutputConfig(
-        **{
-            key: output_raw[key]
-            for key in OutputConfig.__dataclass_fields__
-            if key in output_raw
-        }
+        speech=output_raw.get("speech", True),
+        keyboard=keyboard,
     )
 
     config = Config(
         **{
             key: raw[key]
             for key in Config.__dataclass_fields__
-            if key in raw and key not in ("readout", "output")
+            if key in raw and key != "output"
         }
     )
-    config.readout = readout
     config.output = output
 
     return config

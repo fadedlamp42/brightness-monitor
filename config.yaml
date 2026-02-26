@@ -12,67 +12,71 @@ window: "five_hour"
 poll_interval: 60
 
 # -- output surfaces --
-# toggle which output channels are active.
-# speech: whispered hourly readouts (cmd+shift+b) and full voice reports (cmd+shift+alt+b)
-# keyboard: ambient brightness mapping, pulse mode, and blink readouts
 output:
+
+  # voice readouts via cute-say
+  # cmd+shift+b = whispered hourly percentage (chatterbox)
+  # cmd+shift+alt+b = full spoken report (kokoro 1.4x)
   speech: true
-  keyboard: false
 
-# brightness floor — the dimmest the keyboard goes at 100% utilization
-# 0.0 = fully dark, 0.05 = faint glow
-min_brightness: 0.0
+  # MacBook keyboard backlight control
+  keyboard:
+    enabled: false
 
-# fade speed for brightness transitions
-# -1 = system default (smooth fade)
-#  0 = instant snap (no transition)
-#  higher = slower fades
-fade_speed: 3
+    # brightness floor — the dimmest the keyboard goes at 100% utilization
+    # 0.0 = fully dark, 0.05 = faint glow
+    min_brightness: 0.0
 
-# -- pulse mode (breathing animation when running low) --
+    # fade speed for brightness transitions
+    # -1 = system default (smooth fade)
+    #  0 = instant snap (no transition)
+    #  higher = slower fades
+    fade_speed: 3
 
-# remaining percentage at which pulse mode kicks in
-# the keyboard breathes between 0 and N% where N is the remaining %
-pulse_threshold: 10.0
+    # -- pulse mode (breathing animation when running low) --
 
-# how many seconds for one full breath cycle (in and out)
-pulse_period: 3.0
+    # remaining percentage at which pulse mode kicks in
+    # the keyboard breathes between 0 and N% where N is the remaining %
+    pulse_threshold: 10.0
 
-# -- percentage readout (blink the remaining % periodically) --
-# blinks the tens digit, pauses, then blinks the units digit
-# example: 24% remaining = 2 blinks, pause, 4 blinks
-# a digit of 0 is shown as one long blink
-#
-# also triggerable on-demand via SIGUSR1:
-#   pm2 sendSignal SIGUSR1 brightness-monitor
+    # how many seconds for one full breath cycle (in and out)
+    pulse_period: 3.0
 
-readout:
-  # trigger a readout every time remaining crosses a multiple of this
-  # 5 = readout at 100%, 95%, 90%, ... 5% (20 notifications per cycle)
-  every_percent: 5
+    # -- percentage readout (blink the remaining % periodically) --
+    # blinks the tens digit, pauses, then blinks the units digit
+    # example: 24% remaining = 2 blinks, pause, 4 blinks
+    # a digit of 0 is shown as one long blink
+    #
+    # also triggerable on-demand via SIGUSR1:
+    #   pm2 sendSignal SIGUSR1 brightness-monitor
 
-  # only show readouts when remaining is at or below this threshold
-  # 100 = always show; 60 = only below 60%
-  threshold: 100.0
+    readout:
+      # trigger a readout every time remaining crosses a multiple of this
+      # 5 = readout at 100%, 95%, 90%, ... 5% (20 notifications per cycle)
+      every_percent: 5
 
-  # granularity of the displayed percentage
-  # "ones" = exact percentage (24% = 2+4 blinks)
-  # "tens" = tens digit only (24% = 2 blinks)
-  granularity: "ones"
+      # only show readouts when remaining is at or below this threshold
+      # 100 = always show; 60 = only below 60%
+      threshold: 100.0
 
-  # how long each blink stays fully lit (seconds)
-  blink_on: 0.20
+      # granularity of the displayed percentage
+      # "ones" = exact percentage (24% = 2+4 blinks)
+      # "tens" = tens digit only (24% = 2 blinks)
+      granularity: "ones"
 
-  # gap between blinks (seconds)
-  blink_off: 0.12
+      # how long each blink stays fully lit (seconds)
+      blink_on: 0.20
 
-  # fade speed for readout blinks (independent from main fade_speed)
-  # 0 = hard snap, 1-3 = slight softness, higher = more gradual
-  # try 2 for a crisp-but-not-jarring feel
-  fade_speed: 2
+      # gap between blinks (seconds)
+      blink_off: 0.12
 
-  # pause between tens digit and units digit (seconds)
-  digit_pause: 1
+      # fade speed for readout blinks (independent from main fade_speed)
+      # 0 = hard snap, 1-3 = slight softness, higher = more gradual
+      # try 2 for a crisp-but-not-jarring feel
+      fade_speed: 2
 
-  # pause after the full readout before resuming normal brightness
-  end_pause: 2
+      # pause between tens digit and units digit (seconds)
+      digit_pause: 1
+
+      # pause after the full readout before resuming normal brightness
+      end_pause: 2

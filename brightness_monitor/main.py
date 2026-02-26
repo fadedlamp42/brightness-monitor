@@ -4,18 +4,17 @@ full brightness = fresh window, lots of tokens left.
 darkness = approaching the limit.
 pulsing = almost out, <=threshold remaining.
 periodic blink readout = flash the remaining percentage as digit blinks.
+whispered readout = spoken hourly percentage via chatterbox.
+full voice report = thorough status via kokoro covering all windows.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import math
 import signal
-import subprocess
 import threading
 import time
-from datetime import datetime
 from typing import Optional
 
 from brightness_monitor.brightness import (
@@ -25,13 +24,16 @@ from brightness_monitor.brightness import (
     suspend_idle_dimming,
 )
 from brightness_monitor.config import Config, load_config
+from brightness_monitor.keyboard import (
+    utilization_to_brightness,
+    pulse_brightness,
+    blink_percentage_readout,
+)
+from brightness_monitor.speech import whisper_hourly, speak_full_status
 from brightness_monitor.storage import initialize_database, record_poll
 from brightness_monitor.usage import get_token, fetch_usage, UsageData
 
 log = logging.getLogger("brightness_monitor")
-
-# pulse animation frame rate
-PULSE_FRAME_SECONDS = 0.05  # ~20fps
 
 
 class ShutdownHandler:
@@ -79,113 +81,8 @@ class ShutdownHandler:
         self._wake.clear()
 
 
-def utilization_to_brightness(
-    utilization: float,
-    min_brightness: float,
-) -> float:
-    """map utilization percentage to brightness level.
-
-    0% utilized   -> 1.0 (full brightness, fresh window)
-    100% utilized -> min_brightness (near-dark)
-    """
-    remaining_fraction = (100.0 - utilization) / 100.0
-    return min_brightness + remaining_fraction * (1.0 - min_brightness)
-
-
-def pulse_brightness(
-    max_level: float,
-    duration: float,
-    period: float,
-    fade_speed: int,
-    handler: ShutdownHandler,
-) -> None:
-    """breathe keyboard brightness between 0 and max_level.
-
-    uses a sine wave for smooth animation. runs for `duration`
-    seconds or until shutdown is requested.
-
-    the effect: as remaining tokens shrink, the pulse gets dimmer
-    and dimmer — like a candle about to go out.
-    """
-    start = time.monotonic()
-    while handler.running and (time.monotonic() - start) < duration:
-        elapsed = time.monotonic() - start
-        phase = (elapsed % period) / period
-        # sine wave: 0 -> max_level -> 0 -> max_level ...
-        level = max_level * (0.5 + 0.5 * math.sin(2 * math.pi * phase - math.pi / 2))
-        set_brightness(level, fade_speed=fade_speed)
-        time.sleep(PULSE_FRAME_SECONDS)
-
-
-def blink_digit(
-    digit: int,
-    config: Config,
-    handler: ShutdownHandler,
-) -> None:
-    """blink the keyboard `digit` times to represent a single digit.
-
-    0 is shown as one long blink (twice the normal on-duration).
-    """
-    if not handler.running:
-        return
-
-    fade = config.readout.fade_speed
-
-    if digit == 0:
-        # long blink for zero
-        set_brightness(1.0, fade_speed=fade)
-        time.sleep(config.readout.blink_on * 2)
-        set_brightness(0.0, fade_speed=fade)
-        time.sleep(config.readout.blink_off)
-        return
-
-    for i in range(digit):
-        if not handler.running:
-            return
-        set_brightness(1.0, fade_speed=fade)
-        time.sleep(config.readout.blink_on)
-        set_brightness(0.0, fade_speed=fade)
-        time.sleep(config.readout.blink_off)
-
-
-def blink_percentage_readout(
-    remaining_percent: float,
-    config: Config,
-    handler: ShutdownHandler,
-) -> None:
-    """flash the remaining percentage as blink patterns.
-
-    example: 24% remaining = 2 blinks, pause, 4 blinks.
-    """
-    clamped = max(0, min(99, int(remaining_percent)))
-    tens = clamped // 10
-    ones = clamped % 10
-
-    log.info(
-        "readout: %(pct)d%% remaining -> %(tens)d + %(ones)d blinks",
-        {"pct": clamped, "tens": tens, "ones": ones},
-    )
-
-    fade = config.readout.fade_speed
-
-    # go dark first so the readout is clearly separate from normal brightness
-    set_brightness(0.0, fade_speed=fade)
-    time.sleep(0.3)
-
-    if config.readout.granularity == "tens":
-        blink_digit(tens, config, handler)
-    else:
-        blink_digit(tens, config, handler)
-        time.sleep(config.readout.digit_pause)
-        blink_digit(ones, config, handler)
-
-    # hold dark briefly, then end pause
-    set_brightness(0.0, fade_speed=fade)
-    time.sleep(config.readout.end_pause)
-
-
 def format_status(usage: UsageData) -> str:
-    """single-line summary of all usage windows."""
+    """single-line summary of all usage windows for logging."""
     parts = []
     for window in usage.windows:
         remaining = 100.0 - window.utilization
@@ -195,131 +92,6 @@ def format_status(usage: UsageData) -> str:
             % {"label": label, "remaining": remaining}
         )
     return " | ".join(parts)
-
-
-def _format_relative_time(target: Optional[datetime]) -> str:
-    """format a datetime as natural spoken relative time.
-
-    returns phrases like "in about an hour", "in 3 days", "tomorrow".
-    returns empty string if target is None.
-    """
-    if target is None:
-        return ""
-
-    now = datetime.now(tz=target.tzinfo)
-    total_seconds = (target - now).total_seconds()
-
-    if total_seconds <= 0:
-        return "any moment now"
-
-    minutes = total_seconds / 60
-    hours = total_seconds / 3600
-    days = total_seconds / 86400
-
-    if minutes < 2:
-        return "in about a minute"
-    if hours < 1:
-        return "in %d minutes" % int(minutes)
-    if hours < 2:
-        return "in about an hour"
-    if hours < 24:
-        return "in %d hours" % int(hours)
-    if days < 2:
-        return "tomorrow"
-
-    return "in %d days" % int(days)
-
-
-def format_voice_status(usage: UsageData) -> str:
-    """format a thorough spoken status update for cute-say.
-
-    includes: hourly remaining (for verifying blink readouts), weekly remaining,
-    per-model breakdown (opus/sonnet), and reset times for all windows.
-    plain delivery, no paralinguistic tags.
-    """
-    windows_by_name = {w.name: w for w in usage.windows}
-
-    five_hour = windows_by_name.get("five_hour")
-    seven_day = windows_by_name.get("seven_day")
-    opus = windows_by_name.get("seven_day_opus")
-    sonnet = windows_by_name.get("seven_day_sonnet")
-
-    parts = []
-
-    # hourly first — this is what the keyboard blinks show, so state it
-    # clearly so the user can verify what they just saw
-    if five_hour:
-        hr_left = int(100 - five_hour.utilization)
-        reset = _format_relative_time(five_hour.resets_at)
-        fragment = "hourly has %d percent left" % hr_left
-        if reset:
-            fragment += ", resets %s" % reset
-        parts.append(fragment)
-
-    # weekly aggregate
-    if seven_day:
-        wk_left = int(100 - seven_day.utilization)
-        reset = _format_relative_time(seven_day.resets_at)
-        fragment = "weekly has %d percent left" % wk_left
-        if reset:
-            fragment += ", resets %s" % reset
-        parts.append(fragment)
-
-    # per-model breakdown when available
-    model_bits = []
-    if opus:
-        model_bits.append("opus at %d" % int(100 - opus.utilization))
-    if sonnet:
-        model_bits.append("sonnet at %d" % int(100 - sonnet.utilization))
-    if model_bits:
-        parts.append(", ".join(model_bits))
-
-    return ". ".join(parts)
-
-
-def whisper_hourly(usage: UsageData) -> None:
-    """fire-and-forget: whisper the hourly remaining % via chatterbox.
-
-    uses the [whispering] paralinguistic tag for a subtle, ambient readout.
-    chatterbox (default mode) supports these tags natively.
-    """
-    windows_by_name = {w.name: w for w in usage.windows}
-    five_hour = windows_by_name.get("five_hour")
-    if not five_hour:
-        log.warning("no five_hour window available for whisper readout")
-        return
-
-    hr_left = int(100 - five_hour.utilization)
-    text = "[whispering] %d percent" % hr_left
-    log.info("whisper readout: %(text)s", {"text": text})
-
-    try:
-        subprocess.Popen(
-            ["cute-say", text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        log.warning("cute-say not found in PATH, skipping whisper readout")
-
-
-def speak_full_status(usage: UsageData) -> None:
-    """fire-and-forget: thorough voice status via kokoro at 1.4x speed.
-
-    covers hourly, weekly, per-model breakdown, and reset times.
-    uses kokoro mode for speed control.
-    """
-    text = format_voice_status(usage)
-    log.info("voice readout: %(text)s", {"text": text})
-
-    try:
-        subprocess.Popen(
-            ["cute-say", "-k", "-s", "1.4", text],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        log.warning("cute-say not found in PATH, skipping voice readout")
 
 
 def _readout_bucket(remaining: float, every_percent: float) -> int:
@@ -340,6 +112,8 @@ def run_daemon(
     handler = ShutdownHandler()
     signal.signal(signal.SIGINT, handler.handle_signal)
     signal.signal(signal.SIGTERM, handler.handle_signal)
+
+    keyboard = config.output.keyboard
 
     # SIGUSR1 triggers an immediate readout (cmd+shift+b)
     # speech: whispered hourly, keyboard: blink readout
@@ -372,7 +146,7 @@ def run_daemon(
     # initialize usage history database
     db = initialize_database()
 
-    if not dry_run and config.output.keyboard:
+    if not dry_run and keyboard.enabled:
         handler.save_state()
         suspend_idle_dimming(True)
         set_auto_brightness(False)
@@ -424,15 +198,15 @@ def run_daemon(
             # check if we crossed a percentage threshold since last readout
             current_bucket = _readout_bucket(
                 remaining,
-                config.readout.every_percent,
+                keyboard.readout.every_percent,
             )
             crossed_threshold = (
                 last_bucket is not None
                 and current_bucket != last_bucket
-                and remaining <= config.readout.threshold
+                and remaining <= keyboard.readout.threshold
             )
             # first poll always fires a readout if within threshold
-            first_poll = last_bucket is None and remaining <= config.readout.threshold
+            first_poll = last_bucket is None and remaining <= keyboard.readout.threshold
 
             should_readout = crossed_threshold or first_poll or readout_requested
             readout_requested = False
@@ -445,7 +219,7 @@ def run_daemon(
                     whisper_hourly(usage)
 
                 # blink readout via keyboard backlight
-                if config.output.keyboard:
+                if keyboard.enabled:
                     if dry_run:
                         log.info(
                             "readout (dry): %(pct)d%% -> %(tens)d + %(ones)d blinks",
@@ -456,7 +230,9 @@ def run_daemon(
                             },
                         )
                     else:
-                        blink_percentage_readout(remaining, config, handler)
+                        blink_percentage_readout(
+                            remaining, keyboard, lambda: handler.running
+                        )
 
             # full voice report via kokoro (independent of standard readout)
             if voice_readout_requested:
@@ -467,8 +243,8 @@ def run_daemon(
             last_bucket = current_bucket
 
             # keyboard brightness control — only when keyboard output is enabled
-            if config.output.keyboard:
-                if remaining <= config.pulse_threshold:
+            if keyboard.enabled:
+                if remaining <= keyboard.pulse_threshold:
                     pulse_max = remaining / 100.0
                     log.info(
                         "pulse mode on %(window)s: %(remaining).1f%% left, "
@@ -485,15 +261,15 @@ def run_daemon(
                         pulse_brightness(
                             pulse_max,
                             config.poll_interval,
-                            config.pulse_period,
-                            config.fade_speed,
-                            handler,
+                            keyboard.pulse_period,
+                            keyboard.fade_speed,
+                            lambda: handler.running,
                         )
 
                 else:
                     brightness = utilization_to_brightness(
                         tracked.utilization,
-                        config.min_brightness,
+                        keyboard.min_brightness,
                     )
                     log.info(
                         "steady: %(window)s %(util).1f%% used -> brightness %(b).3f",
@@ -504,7 +280,7 @@ def run_daemon(
                         },
                     )
                     if not dry_run:
-                        set_brightness(brightness, fade_speed=config.fade_speed)
+                        set_brightness(brightness, fade_speed=keyboard.fade_speed)
                     handler.interruptible_sleep(config.poll_interval)
 
             else:
@@ -512,7 +288,7 @@ def run_daemon(
                 handler.interruptible_sleep(config.poll_interval)
 
     finally:
-        if not dry_run and config.output.keyboard:
+        if not dry_run and keyboard.enabled:
             handler.restore_state()
         db.close()
         log.info("shutdown complete")
@@ -559,21 +335,28 @@ def main():
     config_path = Path(args.config) if args.config else None
     config = load_config(config_path)
 
+    kb = config.output.keyboard
     log.info(
-        "config: window=%(window)s, poll=%(poll)ds, fade=%(fade)d, "
-        "pulse<%(pulse).0f%%, readout every %(every).0f%% below %(thresh).0f%%, "
+        "config: window=%(window)s, poll=%(poll)ds, "
         "output: speech=%(speech)s keyboard=%(keyboard)s",
         {
             "window": config.window,
             "poll": config.poll_interval,
-            "fade": config.fade_speed,
-            "pulse": config.pulse_threshold,
-            "every": config.readout.every_percent,
-            "thresh": config.readout.threshold,
             "speech": config.output.speech,
-            "keyboard": config.output.keyboard,
+            "keyboard": kb.enabled,
         },
     )
+    if kb.enabled:
+        log.info(
+            "keyboard: fade=%(fade)d, pulse<%(pulse).0f%%, "
+            "readout every %(every).0f%% below %(thresh).0f%%",
+            {
+                "fade": kb.fade_speed,
+                "pulse": kb.pulse_threshold,
+                "every": kb.readout.every_percent,
+                "thresh": kb.readout.threshold,
+            },
+        )
 
     run_daemon(
         config=config,
