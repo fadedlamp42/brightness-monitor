@@ -47,6 +47,10 @@ from brightness_monitor.usage import get_token, fetch_usage, AuthExpiredError, U
 
 log = logging.getLogger("brightness_monitor")
 
+# how often to automatically attempt re-authentication when token is expired.
+# keeps UsageDB gaps to at most this duration instead of waiting for SIGUSR1.
+REAUTH_INTERVAL_SECONDS = 300  # 5 minutes
+
 
 class ShutdownHandler:
     """saves original keyboard state and restores it on exit."""
@@ -190,10 +194,37 @@ def run_daemon(
 
     signal.signal(signal.SIGUSR2, handle_usr2)
 
-    # verify credentials exist at startup
-    log.info("resolving Claude OAuth token")
-    get_token(explicit_token=token_override)
-    log.info("authenticated")
+    # verify credentials actually work at startup — not just that a token
+    # exists, but that it's accepted by the API. auto-reauths if expired
+    # so the daemon never enters the main loop with a dead token.
+    log.info("validating Claude OAuth token")
+    while handler.running:
+        try:
+            token = get_token(explicit_token=token_override)
+            fetch_usage(token)
+            log.info("auth validated, token is live")
+            break
+        except AuthExpiredError:
+            log.warning("token expired at startup, attempting reauth")
+            if config.output.speech:
+                announce_auth_login_started()
+            success = _attempt_reauth()
+            if config.output.speech:
+                announce_auth_login_result(success)
+            if success:
+                log.info("startup reauth succeeded")
+                continue  # re-validate with fresh token
+            log.warning(
+                "startup reauth failed, retrying in %(interval)ds",
+                {"interval": REAUTH_INTERVAL_SECONDS},
+            )
+            handler.interruptible_sleep(REAUTH_INTERVAL_SECONDS)
+        except RuntimeError as error:
+            log.warning(
+                "startup auth check failed: %(error)s, retrying in %(interval)ds",
+                {"error": error, "interval": REAUTH_INTERVAL_SECONDS},
+            )
+            handler.interruptible_sleep(REAUTH_INTERVAL_SECONDS)
 
     # initialize usage history database
     db = initialize_database()
@@ -208,13 +239,20 @@ def run_daemon(
     last_fetch_time: float = 0.0
     cached_usage: Optional[UsageData] = None
     auth_expired = False
+    last_reauth_attempt: float = 0.0
 
     try:
         while handler.running:
-            # when auth is expired, wait for SIGUSR1 to trigger re-login
+            # when auth is expired, attempt re-login either on SIGUSR1
+            # (immediate) or automatically every REAUTH_INTERVAL_SECONDS
+            # to minimize data gaps in UsageDB.
             if auth_expired:
-                if readout_requested:
+                seconds_since_reauth = time.monotonic() - last_reauth_attempt
+                should_auto_reauth = seconds_since_reauth >= REAUTH_INTERVAL_SECONDS
+
+                if readout_requested or should_auto_reauth:
                     readout_requested = False
+                    last_reauth_attempt = time.monotonic()
                     if config.output.speech:
                         announce_auth_login_started()
                     success = _attempt_reauth()
@@ -247,8 +285,11 @@ def run_daemon(
                     usage = fetch_usage(token)
                 except AuthExpiredError:
                     log.warning("auth token expired")
-                    if not auth_expired and config.output.speech:
-                        announce_auth_expired()
+                    if not auth_expired:
+                        if config.output.speech:
+                            announce_auth_expired()
+                        # schedule first auto-reauth attempt in REAUTH_INTERVAL_SECONDS
+                        last_reauth_attempt = time.monotonic()
                     auth_expired = True
                     handler.interruptible_sleep(config.poll_interval)
                     continue
