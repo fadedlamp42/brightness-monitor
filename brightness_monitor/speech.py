@@ -11,15 +11,16 @@ from __future__ import annotations
 import logging
 import subprocess
 from datetime import datetime
-from typing import Optional
+from typing import TYPE_CHECKING
 
-from brightness_monitor.storage import BurnRate
-from brightness_monitor.usage import UsageData
+if TYPE_CHECKING:
+    from brightness_monitor.storage import BurnRate
+    from brightness_monitor.usage import UsageData
 
 log = logging.getLogger(__name__)
 
 
-def _format_relative_time(target: Optional[datetime]) -> str:
+def _format_relative_time(target: datetime | None) -> str:
     """format a datetime as natural spoken relative time.
 
     returns phrases like "in about an hour", "in 3 days", "tomorrow".

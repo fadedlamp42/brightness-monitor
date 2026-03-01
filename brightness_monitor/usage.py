@@ -15,11 +15,10 @@ import json
 import logging
 import os
 import subprocess
-import urllib.request
 import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +35,7 @@ class AuthExpiredError(RuntimeError):
 class UsageWindow:
     name: str
     utilization: float  # 0-100, percentage of window consumed
-    resets_at: Optional[datetime]
+    resets_at: datetime | None
 
 
 @dataclass
@@ -45,7 +44,7 @@ class UsageData:
     most_constrained: UsageWindow
 
 
-def _token_from_keychain() -> Optional[str]:
+def _token_from_keychain() -> str | None:
     """try to pull the OAuth token from macOS Keychain.
 
     Claude Code stores credentials under the service name
@@ -67,7 +66,7 @@ def _token_from_keychain() -> Optional[str]:
         return None
 
 
-def _token_from_env() -> Optional[str]:
+def _token_from_env() -> str | None:
     """check for CLAUDE_OAUTH_TOKEN environment variable."""
     token = os.environ.get(TOKEN_ENV_VAR)
     if token:
@@ -75,7 +74,7 @@ def _token_from_env() -> Optional[str]:
     return token
 
 
-def get_token(explicit_token: Optional[str] = None) -> str:
+def get_token(explicit_token: str | None = None) -> str:
     """resolve an OAuth token from all available sources.
 
     tries in order: explicit value, env var, Keychain.
@@ -97,8 +96,7 @@ def get_token(explicit_token: Optional[str] = None) -> str:
         "no Claude OAuth token found. provide one via:\n"
         "  1. --token flag\n"
         "  2. %(env)s environment variable\n"
-        "  3. macOS Keychain (auto-populated by Claude Code OAuth login)"
-        % {"env": TOKEN_ENV_VAR}
+        "  3. macOS Keychain (auto-populated by Claude Code OAuth login)" % {"env": TOKEN_ENV_VAR}
     )
 
 
@@ -124,8 +122,7 @@ def fetch_usage(token: str) -> UsageData:
     except urllib.error.HTTPError as error:
         if error.code == 401:
             raise AuthExpiredError(
-                "OAuth token expired or invalid; "
-                "re-authenticate or provide a fresh token"
+                "OAuth token expired or invalid; re-authenticate or provide a fresh token"
             ) from error
         raise
 

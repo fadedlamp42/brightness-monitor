@@ -15,9 +15,10 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
-from brightness_monitor.usage import UsageData
+if TYPE_CHECKING:
+    from brightness_monitor.usage import UsageData
 
 log = logging.getLogger(__name__)
 
@@ -41,7 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_polls_window_name
 """
 
 
-def initialize_database(db_path: Optional[Path] = None) -> sqlite3.Connection:
+def initialize_database(db_path: Path | None = None) -> sqlite3.Connection:
     """open (or create) the usage database and ensure schema exists.
 
     returns a persistent connection for the daemon's lifetime.
@@ -88,13 +89,13 @@ def record_poll(connection: sqlite3.Connection, usage: UsageData) -> None:
 class BurnRate:
     """usage consumption rate and projection for a single window."""
 
-    utilization_per_hour: Optional[float]
+    utilization_per_hour: float | None
     """% consumed per hour based on recent history. None if insufficient data."""
 
-    projected_remaining_at_reset: Optional[float]
+    projected_remaining_at_reset: float | None
     """projected % remaining when window resets. None if no reset time or no rate."""
 
-    hours_until_reset: Optional[float]
+    hours_until_reset: float | None
     """hours until window resets. None if no reset time."""
 
     sample_minutes: float
@@ -111,7 +112,7 @@ BURN_RATE_MINIMUM_POLLS = 3
 def calculate_burn_rate(
     connection: sqlite3.Connection,
     window_name: str,
-    resets_at: Optional[datetime],
+    resets_at: datetime | None,
 ) -> BurnRate:
     """calculate consumption rate from recent poll history.
 

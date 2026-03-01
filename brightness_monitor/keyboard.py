@@ -11,9 +11,12 @@ from __future__ import annotations
 import logging
 import math
 import time
+from typing import TYPE_CHECKING
 
 from brightness_monitor.brightness import set_brightness
-from brightness_monitor.config import KeyboardConfig
+
+if TYPE_CHECKING:
+    from brightness_monitor.config import KeyboardConfig
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +85,7 @@ def blink_digit(
         time.sleep(readout.blink_off)
         return
 
-    for i in range(digit):
+    for _i in range(digit):
         if not running_check():
             return
         set_brightness(1.0, fade_speed=fade)

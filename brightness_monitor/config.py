@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import yaml
 
@@ -61,7 +60,7 @@ def _parse_nested_dataclass(dataclass_type, raw: dict):
     )
 
 
-def load_config(path: Optional[Path] = None) -> Config:
+def load_config(path: Path | None = None) -> Config:
     """load config from yaml file, falling back to defaults for missing keys."""
     config_path = path or DEFAULT_CONFIG_PATH
 
@@ -93,11 +92,7 @@ def load_config(path: Optional[Path] = None) -> Config:
     )
 
     config = Config(
-        **{
-            key: raw[key]
-            for key in Config.__dataclass_fields__
-            if key in raw and key != "output"
-        }
+        **{key: raw[key] for key in Config.__dataclass_fields__ if key in raw and key != "output"}
     )
     config.output = output
 
