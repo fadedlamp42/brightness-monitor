@@ -12,6 +12,7 @@ import time
 from typing import TYPE_CHECKING
 
 from prism.logging import get_logger
+from prism.mac.screen import is_screen_locked
 
 from brightness_monitor.auth import REAUTH_INTERVAL_SECONDS, attempt_reauth
 from brightness_monitor.brightness import (
@@ -120,6 +121,13 @@ def _validate_auth_at_startup(
     """
     logger.info("validating Claude OAuth token")
     while handler.running:
+        # don't attempt auth validation while the screen is locked —
+        # avoids opening browser tabs nobody's around to complete
+        if is_screen_locked():
+            logger.debug("screen locked, deferring auth validation")
+            handler.interruptible_sleep(REAUTH_INTERVAL_SECONDS)
+            continue
+
         try:
             token = get_token(explicit_token=token_override)
             fetch_usage(token)
@@ -206,9 +214,32 @@ def run_daemon(
     cached_usage: UsageData | None = None
     auth_expired = False
     last_reauth_attempt: float = 0.0
+    screen_was_locked = False
 
     try:
         while handler.running:
+            # suspend everything while the screen is locked — no polling,
+            # no auth attempts, no speech, no keyboard changes. prevents
+            # re-auth from opening dozens of browser tabs overnight.
+            screen_locked = is_screen_locked()
+            if screen_locked:
+                if not screen_was_locked:
+                    logger.info("screen locked, suspending")
+                    # restore keyboard to normal so it behaves naturally while locked
+                    if not dry_run and keyboard.enabled:
+                        handler.restore_state()
+                    screen_was_locked = True
+                handler.interruptible_sleep(config.poll_interval)
+                continue
+
+            if screen_was_locked:
+                logger.info("screen unlocked, resuming")
+                if not dry_run and keyboard.enabled:
+                    handler.save_state()
+                    suspend_idle_dimming(True)
+                    set_auto_brightness(False)
+                screen_was_locked = False
+
             # when auth is expired, attempt re-login either on SIGUSR1
             # (immediate) or automatically every REAUTH_INTERVAL_SECONDS
             # to minimize data gaps in UsageDB.
