@@ -125,6 +125,8 @@ def fetch_usage(token: str) -> UsageData:
                 "OAuth token expired or invalid; re-authenticate or provide a fresh token"
             ) from error
         raise
+    except urllib.error.URLError as error:
+        raise RuntimeError("network error fetching usage: %(error)s" % {"error": error}) from error
 
     window_keys = (
         "five_hour",
