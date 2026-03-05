@@ -20,7 +20,7 @@ logger = get_logger()
 
 def main():
     parser = argparse.ArgumentParser(
-        description="sync MacBook keyboard brightness to Claude API usage",
+        description="sync MacBook keyboard brightness to AI usage windows",
     )
     parser.add_argument(
         "--config",
@@ -32,7 +32,7 @@ def main():
         "--token",
         type=str,
         default=None,
-        help="OAuth token (overrides env var and Keychain lookup)",
+        help="provider token override (supports claude oauth or codex bearer token)",
     )
     parser.add_argument(
         "--dry-run",
@@ -56,6 +56,7 @@ def main():
     kb = config.output.keyboard
     logger.info(
         "config loaded",
+        provider=config.provider.name,
         window=config.window,
         poll_interval=config.poll_interval,
         speech=config.output.speech,

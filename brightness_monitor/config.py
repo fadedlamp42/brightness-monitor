@@ -2,6 +2,9 @@
 
 looks for config.yaml in the project root (next to pyproject.toml).
 missing keys fall back to built-in defaults.
+
+config now includes a provider section so usage sources are pluggable
+(for example claude oauth API vs codex usage API).
 """
 
 from __future__ import annotations
@@ -59,9 +62,30 @@ class StttsConfig:
 
 
 @dataclass
+class CodexProviderConfig:
+    auth_file: str = "~/.codex/auth.json"
+    fallback_auth_files: list[str] = field(
+        default_factory=lambda: ["~/.local/share/opencode/auth.json"]
+    )
+    usage_url: str = "https://chatgpt.com/backend-api/wham/usage"
+    refresh_url: str = "https://auth.openai.com/oauth/token"
+    refresh_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
+    request_timeout_seconds: int = 10
+    sessions_root: str = "~/.codex/sessions"
+    max_staleness_seconds: int = 1800
+
+
+@dataclass
+class ProviderConfig:
+    name: str = "claude"
+    codex: CodexProviderConfig = field(default_factory=CodexProviderConfig)
+
+
+@dataclass
 class Config:
     window: str = "five_hour"
     poll_interval: int = 60
+    provider: ProviderConfig = field(default_factory=ProviderConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     sttts: StttsConfig = field(default_factory=StttsConfig)
 
@@ -108,13 +132,20 @@ def load_config(path: Path | None = None) -> Config:
     sttts_raw = raw.pop("sttts", {}) or {}
     sttts = _parse_nested_dataclass(StttsConfig, sttts_raw)
 
+    # parse provider section
+    provider_raw = raw.pop("provider", {}) or {}
+    codex_raw = provider_raw.pop("codex", {}) or {}
+    provider = _parse_nested_dataclass(ProviderConfig, provider_raw)
+    provider.codex = _parse_nested_dataclass(CodexProviderConfig, codex_raw)
+
     config = Config(
         **{
             key: raw[key]
             for key in Config.__dataclass_fields__
-            if key in raw and key not in ("output", "sttts")
+            if key in raw and key not in ("output", "sttts", "provider")
         }
     )
+    config.provider = provider
     config.output = output
     config.sttts = sttts
 

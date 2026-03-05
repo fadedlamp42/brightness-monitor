@@ -1,8 +1,8 @@
 """SQLite storage for usage poll history.
 
-stores every poll result as one row per usage window. the database
-lives in the repo root so it can be version-controlled as a lightweight
-backup of usage history.
+stores every poll result as one row per usage window and provider.
+the database lives in the repo root so it can be version-controlled
+as a lightweight backup of usage history.
 
 also provides burn rate analysis by looking at recent poll history
 to calculate consumption rate and project forward to window reset.
@@ -28,6 +28,7 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "usage.db"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS usage_polls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL DEFAULT 'claude',
     polled_at TEXT NOT NULL,
     window_name TEXT NOT NULL,
     utilization REAL NOT NULL,
@@ -42,6 +43,25 @@ CREATE INDEX IF NOT EXISTS idx_polls_window_name
     ON usage_polls (window_name);
 """
 
+PROVIDER_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_polls_provider_window_polled_at "
+    "ON usage_polls (provider, window_name, polled_at)"
+)
+
+
+def _migrate_provider_column_if_missing(connection: sqlite3.Connection) -> None:
+    """backfill `provider` column on older databases created pre-providers."""
+    columns = connection.execute("PRAGMA table_info(usage_polls)").fetchall()
+    column_names = {column[1] for column in columns}
+    if "provider" in column_names:
+        return
+
+    connection.execute(
+        "ALTER TABLE usage_polls ADD COLUMN provider TEXT NOT NULL DEFAULT 'claude'"
+    )
+    connection.commit()
+    logger.info("migrated usage_polls table", added_column="provider")
+
 
 def initialize_database(db_path: Path | None = None) -> sqlite3.Connection:
     """open (or create) the usage database and ensure schema exists.
@@ -53,17 +73,24 @@ def initialize_database(db_path: Path | None = None) -> sqlite3.Connection:
 
     connection = sqlite3.connect(str(path))
     connection.executescript(SCHEMA)
+    _migrate_provider_column_if_missing(connection)
+    connection.execute(PROVIDER_INDEX_SQL)
     connection.commit()
 
     return connection
 
 
-def record_poll(connection: sqlite3.Connection, usage: UsageData) -> None:
+def record_poll(
+    connection: sqlite3.Connection,
+    usage: UsageData,
+    provider_name: str,
+) -> None:
     """insert one row per usage window for the current poll."""
     now = datetime.now(tz=timezone.utc).isoformat()
 
     rows = [
         (
+            provider_name,
             now,
             window.name,
             window.utilization,
@@ -74,13 +101,13 @@ def record_poll(connection: sqlite3.Connection, usage: UsageData) -> None:
     ]
 
     connection.executemany(
-        "INSERT INTO usage_polls (polled_at, window_name, utilization, remaining, resets_at) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO usage_polls (provider, polled_at, window_name, utilization, remaining, resets_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         rows,
     )
     connection.commit()
 
-    logger.debug("recorded usage windows", count=len(rows), time=now)
+    logger.debug("recorded usage windows", provider=provider_name, count=len(rows), time=now)
 
 
 @dataclass
@@ -109,6 +136,7 @@ BURN_RATE_MINIMUM_POLLS = 3
 
 def calculate_burn_rate(
     connection: sqlite3.Connection,
+    provider_name: str,
     window_name: str,
     resets_at: datetime | None,
 ) -> BurnRate:
@@ -123,10 +151,11 @@ def calculate_burn_rate(
 
     rows = connection.execute(
         "SELECT polled_at, utilization FROM usage_polls "
-        "WHERE window_name = ? "
+        "WHERE provider = ? "
+        "AND window_name = ? "
         "AND polled_at > datetime(?, '-%d seconds') "
         "ORDER BY polled_at ASC" % lookback_seconds,
-        (window_name, cutoff),
+        (provider_name, window_name, cutoff),
     ).fetchall()
 
     # compute hours until reset

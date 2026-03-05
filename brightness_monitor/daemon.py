@@ -1,7 +1,8 @@
 """core daemon loop: poll usage, map to brightness, handle auth lifecycle.
 
-ties together usage polling, keyboard brightness, speech readouts,
-and re-authentication into a single event loop managed by ShutdownHandler.
+ties together provider-based usage polling, keyboard brightness,
+speech readouts, and re-authentication into a single event loop
+managed by ShutdownHandler.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from typing import TYPE_CHECKING
 from prism.logging import get_logger
 from prism.mac.screen import is_screen_locked
 
-from brightness_monitor.auth import REAUTH_INTERVAL_SECONDS, attempt_reauth
 from brightness_monitor.brightness import (
     get_brightness,
     set_auto_brightness,
@@ -26,6 +26,7 @@ from brightness_monitor.keyboard import (
     pulse_brightness,
     utilization_to_brightness,
 )
+from brightness_monitor.providers import create_usage_provider
 from brightness_monitor.speech import (
     announce_auth_expired,
     announce_auth_login_result,
@@ -41,12 +42,15 @@ from brightness_monitor.storage import (
     initialize_database,
     record_poll,
 )
-from brightness_monitor.usage import AuthExpiredError, UsageData, fetch_usage, get_token
+from brightness_monitor.usage import AuthExpiredError, UsageData
 
 if TYPE_CHECKING:
     from brightness_monitor.config import Config
+    from brightness_monitor.providers import UsageProvider
 
 logger = get_logger()
+
+AUTH_RETRY_INTERVAL_SECONDS = 300
 
 
 class ShutdownHandler:
@@ -109,35 +113,33 @@ def _readout_bucket(remaining: float, every_percent: float) -> int:
     return int(remaining / every_percent)
 
 
-def _validate_auth_at_startup(
+def _validate_provider_at_startup(
     handler: ShutdownHandler,
     config: Config,
-    token_override: str | None,
+    provider: UsageProvider,
 ) -> None:
-    """verify credentials actually work before entering the main loop.
-
-    not just that a token exists, but that it's accepted by the API.
-    auto-reauths if expired so the daemon never starts with a dead token.
-    """
-    logger.info("validating Claude OAuth token")
+    """verify the configured usage provider before entering the main loop."""
+    logger.info("validating usage provider", provider=provider.provider_name)
     while handler.running:
         # don't attempt auth validation while the screen is locked —
         # avoids opening browser tabs nobody's around to complete
         if is_screen_locked():
             logger.debug("screen locked, deferring auth validation")
-            handler.interruptible_sleep(REAUTH_INTERVAL_SECONDS)
+            handler.interruptible_sleep(AUTH_RETRY_INTERVAL_SECONDS)
             continue
 
         try:
-            token = get_token(explicit_token=token_override)
-            fetch_usage(token)
-            logger.info("auth validated, token is live")
+            provider.fetch_usage()
+            logger.info("usage provider validated", provider=provider.provider_name)
             return
         except AuthExpiredError:
-            logger.warning("token expired at startup, attempting reauth")
+            logger.warning(
+                "provider auth expired at startup, attempting reauth",
+                provider=provider.provider_name,
+            )
             if config.output.speech:
                 announce_auth_login_started()
-            success = attempt_reauth()
+            success = provider.attempt_reauth()
             if config.output.speech:
                 announce_auth_login_result(success)
             if success:
@@ -145,16 +147,18 @@ def _validate_auth_at_startup(
                 continue  # re-validate with fresh token
             logger.warning(
                 "startup reauth failed, retrying",
-                interval=REAUTH_INTERVAL_SECONDS,
+                provider=provider.provider_name,
+                interval=AUTH_RETRY_INTERVAL_SECONDS,
             )
-            handler.interruptible_sleep(REAUTH_INTERVAL_SECONDS)
+            handler.interruptible_sleep(AUTH_RETRY_INTERVAL_SECONDS)
         except RuntimeError as error:
             logger.warning(
-                "startup auth check failed, retrying",
+                "startup usage check failed, retrying",
+                provider=provider.provider_name,
                 error=str(error),
-                interval=REAUTH_INTERVAL_SECONDS,
+                interval=AUTH_RETRY_INTERVAL_SECONDS,
             )
-            handler.interruptible_sleep(REAUTH_INTERVAL_SECONDS)
+            handler.interruptible_sleep(AUTH_RETRY_INTERVAL_SECONDS)
 
 
 def run_daemon(
@@ -172,11 +176,14 @@ def run_daemon(
     signal.signal(signal.SIGINT, handler.handle_signal)
     signal.signal(signal.SIGTERM, handler.handle_signal)
 
+    provider = create_usage_provider(config, token_override=token_override)
+    logger.info("using usage provider", provider=provider.provider_name)
+
     keyboard = config.output.keyboard
 
     # SIGUSR1 triggers an immediate readout (cmd+shift+b)
     # speech: whispered hourly, keyboard: blink readout
-    # when auth is expired: triggers re-authentication via claude auth login
+    # when auth is expired: triggers provider re-authentication if available
     readout_requested = False
 
     def handle_usr1(signum, frame):
@@ -198,7 +205,7 @@ def run_daemon(
 
     signal.signal(signal.SIGUSR2, handle_usr2)
 
-    _validate_auth_at_startup(handler, config, token_override)
+    _validate_provider_at_startup(handler, config, provider)
 
     # initialize usage history database
     db = initialize_database()
@@ -241,23 +248,26 @@ def run_daemon(
                 screen_was_locked = False
 
             # when auth is expired, attempt re-login either on SIGUSR1
-            # (immediate) or automatically every REAUTH_INTERVAL_SECONDS
+            # (immediate) or automatically every AUTH_RETRY_INTERVAL_SECONDS
             # to minimize data gaps in UsageDB.
             if auth_expired:
                 seconds_since_reauth = time.monotonic() - last_reauth_attempt
-                should_auto_reauth = seconds_since_reauth >= REAUTH_INTERVAL_SECONDS
+                should_auto_reauth = seconds_since_reauth >= AUTH_RETRY_INTERVAL_SECONDS
 
                 if readout_requested or should_auto_reauth:
                     readout_requested = False
                     last_reauth_attempt = time.monotonic()
                     if config.output.speech:
                         announce_auth_login_started()
-                    success = attempt_reauth()
+                    success = provider.attempt_reauth()
                     if config.output.speech:
                         announce_auth_login_result(success)
                     if success:
                         auth_expired = False
-                        logger.info("auth restored, resuming normal operation")
+                        logger.info(
+                            "auth restored, resuming normal operation",
+                            provider=provider.provider_name,
+                        )
                         # fall through to poll immediately
                     else:
                         handler.interruptible_sleep(config.poll_interval)
@@ -267,7 +277,7 @@ def run_daemon(
                     continue
 
             # debounce API requests — reuse cached data if polled recently.
-            # prevents spamming the usage API when pressing the hotkey
+            # prevents spamming the usage provider when pressing the hotkey
             # multiple times to re-listen to a readout.
             seconds_since_fetch = time.monotonic() - last_fetch_time
             if cached_usage is not None and seconds_since_fetch < config.poll_interval:
@@ -275,20 +285,23 @@ def run_daemon(
                 usage = cached_usage
             else:
                 try:
-                    token = get_token(explicit_token=token_override)
-                    usage = fetch_usage(token)
+                    usage = provider.fetch_usage()
                 except AuthExpiredError:
-                    logger.warning("auth token expired")
+                    logger.warning("provider auth expired", provider=provider.provider_name)
                     if not auth_expired:
                         if config.output.speech:
                             announce_auth_expired()
-                        # schedule first auto-reauth attempt in REAUTH_INTERVAL_SECONDS
+                        # schedule first auto-reauth attempt in AUTH_RETRY_INTERVAL_SECONDS
                         last_reauth_attempt = time.monotonic()
                     auth_expired = True
                     handler.interruptible_sleep(config.poll_interval)
                     continue
                 except RuntimeError as error:
-                    logger.warning("usage fetch failed, skipping", error=str(error))
+                    logger.warning(
+                        "usage fetch failed, skipping",
+                        provider=provider.provider_name,
+                        error=str(error),
+                    )
                     handler.interruptible_sleep(config.poll_interval)
                     continue
 
@@ -297,7 +310,7 @@ def run_daemon(
 
                 # record fresh polls to sqlite for usage history
                 try:
-                    record_poll(db, usage)
+                    record_poll(db, usage, provider_name=provider.provider_name)
                 except Exception as error:
                     logger.warning("failed to record poll to database", error=str(error))
 
@@ -341,6 +354,7 @@ def run_daemon(
                 if config.output.speech:
                     burn_rate = calculate_burn_rate(
                         db,
+                        provider.provider_name,
                         tracked.name,
                         tracked.resets_at,
                     )

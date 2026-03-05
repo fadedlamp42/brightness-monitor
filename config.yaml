@@ -1,6 +1,38 @@
 # brightness-monitor configuration
 # all durations are in seconds unless noted otherwise
 
+# usage provider
+# - "claude": anthropic oauth /limits data (existing behavior)
+# - "codex": poll codex/chatgpt usage API (`/backend-api/wham/usage`)
+# - "codex_logs": parse local codex session logs (~/.codex/sessions)
+provider:
+  name: "codex"
+  codex:
+    # primary auth source (official codex CLI auth file)
+    auth_file: "~/.codex/auth.json"
+
+    # fallback auth sources (opencode stores OpenAI OAuth here)
+    fallback_auth_files:
+      - "~/.local/share/opencode/auth.json"
+
+    # codex usage endpoint used by codex CLI
+    usage_url: "https://chatgpt.com/backend-api/wham/usage"
+
+    # oauth refresh endpoint + codex client id
+    refresh_url: "https://auth.openai.com/oauth/token"
+    refresh_client_id: "app_EMoamEEZ73f0CkXaXp7hrann"
+
+    # request timeout for usage + refresh calls
+    request_timeout_seconds: 10
+
+    # -- settings used only when provider.name = "codex_logs" --
+
+    # root directory containing codex rollout jsonl files
+    sessions_root: "~/.codex/sessions"
+
+    # warn if latest token_count event is older than this (codex_logs only)
+    max_staleness_seconds: 1800
+
 # which usage window to track for brightness and readout
 # "five_hour" = the 5-hour sliding window (resets frequently, gates immediate usage)
 # "seven_day" = weekly aggregate
@@ -8,7 +40,7 @@
 # "most_constrained" = whichever has the highest utilization
 window: "five_hour"
 
-# how often to poll the Claude usage API
+# how often to poll the configured provider
 poll_interval: 60
 
 # sttts inter-service coordination
